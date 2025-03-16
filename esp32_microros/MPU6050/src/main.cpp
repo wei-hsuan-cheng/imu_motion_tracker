@@ -5,6 +5,7 @@
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/quaternion.h>
+#include <geometry_msgs/msg/vector3.h>
 
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
@@ -24,19 +25,26 @@ uint16_t packetSize;
 uint8_t fifoBuffer[64];
 Quaternion q_imu;         // container for the quaternion from the MPU6050
 
+// Variables for acceleration calculations:
+VectorInt16 aa;         // Raw acceleration values from the FIFO
+VectorInt16 aaReal;     // Gravity-compensated (linear) acceleration
+VectorFloat gravity;    // Gravity vector
+
 // Interrupt callback: set flag when data is ready
 void dmpDataReady() {
   mpuInterrupt = true;
 }
 
 // ----- micro-ROS Objects -----
-rcl_publisher_t publisher;
+rcl_publisher_t quat_pub_;
+rcl_publisher_t acc_pub_;
+geometry_msgs__msg__Vector3 acc_msg;
 geometry_msgs__msg__Quaternion q_msg;
+
 rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
-// We're not using a timer callback here, so we omit the timer object.
 
 size_t domain_id = 5; // Set your desired ROS_DOMAIN_ID here
 
@@ -49,6 +57,14 @@ void error_loop() {
   while (1) {
     delay(100);
   }
+}
+
+void imu_calibration() {
+  // Supply your own imu offsets (adjust based on your calibration)
+  mpu.setXGyroOffset(12);
+  mpu.setYGyroOffset(52);
+  mpu.setZGyroOffset(2);
+  mpu.setZAccelOffset(1804);
 }
 
 // Initialize micro-ROS with ROS_DOMAIN_ID support
@@ -67,18 +83,25 @@ void setup_micro_ros() {
   RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
 
   // --- Create Node and Publisher ---
-  RCCHECK(rclc_node_init_default(&node, "imu_quaternion_node", "", &support));
+  RCCHECK(rclc_node_init_default(&node, "mpu6050_imu", "", &support));
 
   RCCHECK(rclc_publisher_init_default(
-    &publisher,
+    &quat_pub_,
     &node,
     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Quaternion),
-    "imu_quaternion"
+    "/mpu6050_imu/quat"
   ));
 
-  // Create the executor (we're not adding a timer here because we'll poll in loop)
+  RCCHECK(rclc_publisher_init_default(
+    &acc_pub_,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
+    "/mpu6050_imu/acc"
+  ));
+
+  // Create the executor
   RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
-  // (Optional: you could add a timer if you need periodic tasks)
+
 }
 
 void setup() {
@@ -94,17 +117,13 @@ void setup() {
   
   mpu.initialize();
   pinMode(INTERRUPT_PIN, INPUT);
-  Serial.println("Testing MPU6050 connection...");
   Serial.println(mpu.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
 
   Serial.println("Initializing DMP...");
   devStatus = mpu.dmpInitialize();
   
-  // Supply your own gyro offsets (adjust based on your calibration)
-  mpu.setXGyroOffset(12);
-  mpu.setYGyroOffset(52);
-  mpu.setZGyroOffset(2);
-  mpu.setZAccelOffset(1804);
+  // Calibrate IMU offsets
+  imu_calibration();
 
   if (devStatus == 0) {
     mpu.CalibrateAccel(6);
@@ -133,16 +152,38 @@ void loop() {
 
   // Process MPU6050 data and publish if available:
   if (dmpReady && mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+    // Reset interrupt flag
     mpuInterrupt = false;
+
+    // Get the quaternion from the FIFO packet and publish it
     mpu.dmpGetQuaternion(&q_imu, fifoBuffer);
     q_msg.w = q_imu.w;
     q_msg.x = q_imu.x;
     q_msg.y = q_imu.y;
     q_msg.z = q_imu.z;
-    RCSOFTCHECK(rcl_publish(&publisher, &q_msg, NULL));
+    RCSOFTCHECK(rcl_publish(&quat_pub_, &q_msg, NULL));
+
+    // Get the acceleration from the FIFO packet and publish it
+    mpu.dmpGetAccel(&aa, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q_imu);
+    mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+    float g_const = 9.80665;
+    float a_s_real[3];
+    a_s_real[0] = (float) aaReal.x * g_const / 8192;
+    a_s_real[1] = (float) aaReal.y * g_const / 8192;
+    a_s_real[2] = (float) aaReal.z * g_const / 8192;
+    acc_msg.x = a_s_real[0];
+    acc_msg.y = a_s_real[1];
+    acc_msg.z = a_s_real[2];
+    RCSOFTCHECK(rcl_publish(&acc_pub_, &acc_msg, NULL));
+
+    // Blink the LED as a simple indicator
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
   }
 }
+
+
+
 
 
 // // IMU position and orientation estimation
@@ -376,42 +417,42 @@ void loop() {
 //             delay(33);
 //         #endif
 
-//         #ifdef OUTPUT_READABLE_REALACCEL
-//             // display real acceleration, adjusted to remove gravity
-//             mpu.dmpGetQuaternion(&q, fifoBuffer);
-//             mpu.dmpGetAccel(&aa, fifoBuffer);
-//             mpu.dmpGetGravity(&gravity, &q);
-//             mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+        // #ifdef OUTPUT_READABLE_REALACCEL
+        //     // display real acceleration, adjusted to remove gravity
+        //     mpu.dmpGetQuaternion(&q, fifoBuffer);
+        //     mpu.dmpGetAccel(&aa, fifoBuffer);
+        //     mpu.dmpGetGravity(&gravity, &q);
+        //     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
             
-//             // Serial.print("areal\t");
-//             // Serial.print(aaReal.x);
-//             // Serial.print("\t");
-//             // Serial.print(aaReal.y);
-//             // Serial.print("\t");
-//             // Serial.println(aaReal.z);
+        //     // Serial.print("areal\t");
+        //     // Serial.print(aaReal.x);
+        //     // Serial.print("\t");
+        //     // Serial.print(aaReal.y);
+        //     // Serial.print("\t");
+        //     // Serial.println(aaReal.z);
 
-//             // Serial.print("g [normalised]\t");
-//             // Serial.print(gravity.x);
-//             // Serial.print("\t");
-//             // Serial.print(gravity.y);
-//             // Serial.print("\t");
-//             // Serial.println(gravity.z);
+        //     // Serial.print("g [normalised]\t");
+        //     // Serial.print(gravity.x);
+        //     // Serial.print("\t");
+        //     // Serial.print(gravity.y);
+        //     // Serial.print("\t");
+        //     // Serial.println(gravity.z);
 
-//             float g = 9.80665;
-//             float a_s_real[3];
-//             a_s_real[0] = (float) aaReal.x * g / 8192;
-//             a_s_real[1] = (float) aaReal.y * g / 8192;
-//             a_s_real[2] = (float) aaReal.z * g / 8192;
+        //     float g = 9.80665;
+        //     float a_s_real[3];
+        //     a_s_real[0] = (float) aaReal.x * g / 8192;
+        //     a_s_real[1] = (float) aaReal.y * g / 8192;
+        //     a_s_real[2] = (float) aaReal.z * g / 8192;
 
-//             Serial.print("areal\t");
-//             Serial.print(a_s_real[0]);
-//             Serial.print("\t");
-//             Serial.print(a_s_real[1]);
-//             Serial.print("\t");
-//             Serial.println(a_s_real[2]);
+        //     Serial.print("areal\t");
+        //     Serial.print(a_s_real[0]);
+        //     Serial.print("\t");
+        //     Serial.print(a_s_real[1]);
+        //     Serial.print("\t");
+        //     Serial.println(a_s_real[2]);
 
-//             delay(33);
-//         #endif
+        //     delay(33);
+        // #endif
 
 //         #ifdef OUTPUT_READABLE_WORLDACCEL
 //             // display initial world-frame acceleration, adjusted to remove gravity

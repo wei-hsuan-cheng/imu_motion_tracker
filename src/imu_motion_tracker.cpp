@@ -23,7 +23,7 @@ public:
 
     // Subscribe to the "imu_quaternion" topic
     subscription_ = this->create_subscription<geometry_msgs::msg::Quaternion>(
-      "imu_quaternion", 10,
+      "/mpu6050_imu/quat", 10,
       std::bind(&IMUMotionTracker::quaternion_callback, this, std::placeholders::_1));
     
     auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
