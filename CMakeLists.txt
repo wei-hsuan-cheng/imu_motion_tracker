@@ -55,31 +55,13 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
 )
 
-# --------------------
-# Find Liquid-DSP manually
-# --------------------
-find_path(LIQUID_DSP_INCLUDE_DIR liquid/liquid.h)
-if(NOT LIQUID_DSP_INCLUDE_DIR)
-  message(FATAL_ERROR "Liquid DSP include directory not found. Please install Liquid-DSP or specify its path.")
-endif()
-include_directories(${LIQUID_DSP_INCLUDE_DIR})
-
-find_library(LIQUID_DSP_LIBRARY NAMES liquid)
-if(NOT LIQUID_DSP_LIBRARY)
-  message(FATAL_ERROR "Liquid DSP library not found. Please install Liquid-DSP or specify its path.")
-endif()
-
 # Source files
 set(IMU_MOTION_TRACKER_SOURCES 
     src/imu_motion_tracker.cpp
-    include/filters/BandPassFilter.cpp
 )
 
 # Add executable
 add_executable(imu_motion_tracker ${IMU_MOTION_TRACKER_SOURCES})
-
-# Link libraries (link Liquid-DSP library as well)
-target_link_libraries(imu_motion_tracker ${LIQUID_DSP_LIBRARY})
 
 # Add dependencies
 ament_target_dependencies(imu_motion_tracker ${dependencies})
