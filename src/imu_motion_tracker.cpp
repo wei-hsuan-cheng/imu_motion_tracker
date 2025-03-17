@@ -9,19 +9,18 @@
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 
-// For mesh marker (optional)
+// For mesh marker
 #include "visualization_msgs/msg/marker.hpp"
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
-// Use your robot math utilities if needed
+// Math libraries
 #include "robot_math_utils/robot_math_utils_v1_8.hpp"
-
-// Include the filters
 #include "filters/hpf.hpp"
 #include "filters/lpf.hpp"
 
 using namespace std::chrono_literals;
 using Eigen::Vector3d;
+
 
 class IMUMotionTracker : public rclcpp::Node
 {
@@ -35,12 +34,12 @@ public:
     // Subscribe to the quaternion topic.
     quat_sub_ = this->create_subscription<geometry_msgs::msg::Quaternion>(
       "/mpu6050_imu/quat", 10,
-      std::bind(&IMUMotionTracker::quaternion_callback, this, std::placeholders::_1));
+      std::bind(&IMUMotionTracker::quat_callback_, this, std::placeholders::_1));
 
     // Subscribe to the acceleration topic.
     acc_sub_ = this->create_subscription<geometry_msgs::msg::Vector3>(
       "/mpu6050_imu/acc", 10,
-      std::bind(&IMUMotionTracker::acceleration_callback, this, std::placeholders::_1));
+      std::bind(&IMUMotionTracker::acc_calback_, this, std::placeholders::_1));
 
     // Optional: publish a mesh marker for visualization.
     auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
@@ -53,8 +52,7 @@ public:
     vel_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/imu_motion_tracker/vel", 10);
     acc_pub_ = this->create_publisher<geometry_msgs::msg::Vector3>("/imu_motion_tracker/acc", 10);
 
-    // Integration parameters.
-    // Here we assume acceleration messages are coming at ~20 Hz.
+    // Sampling rate and period.
     fs_ = 30.0;
     Ts_ = 1.0 / fs_;
 
@@ -80,19 +78,19 @@ public:
     // Create a timer to trigger integration and TF broadcast at a fixed rate.
     timer_ = this->create_wall_timer(
       std::chrono::milliseconds(static_cast<int>(Ts_ * 1000)),
-      std::bind(&IMUMotionTracker::timer_callback, this)
+      std::bind(&IMUMotionTracker::timer_callback_, this)
     );
 
     RCLCPP_INFO(this->get_logger(), "IMUMotionTracker node has been started.");
   }
 
 private:
-  // Subscribers and Timer.
+  // Subscribers and Timer
   rclcpp::Subscription<geometry_msgs::msg::Quaternion>::SharedPtr quat_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Vector3>::SharedPtr acc_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
-  // TF Broadcaster and Mesh Marker publisher.
+  // TF Broadcaster and Mesh Marker publisher
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr mesh_marker_pub_;
 
@@ -102,7 +100,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr vel_pub_;
   rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr acc_pub_;
 
-  // Integration parameters.
+  // Sampling rate and period
   float fs_, Ts_;
 
   // Orientation
@@ -122,14 +120,14 @@ private:
   std::unique_ptr<LowPassFilter<Vector3d>> vel_lpf_;
   std::unique_ptr<LowPassFilter<Vector3d>> acc_lpf_;
 
-  // Callback for quaternion: update the latest quaternion.
-  void quaternion_callback(const geometry_msgs::msg::Quaternion::SharedPtr msg)
+  // Callback for quaternion
+  void quat_callback_(const geometry_msgs::msg::Quaternion::SharedPtr msg)
   {
     quat_ = *msg;
   }
 
-  // Acceleration callback: update the latest acceleration using low-pass filtering.
-  void acceleration_callback(const geometry_msgs::msg::Vector3::SharedPtr msg)
+  // Acceleration callback
+  void acc_calback_(const geometry_msgs::msg::Vector3::SharedPtr msg)
   {
     acc_ = Vector3d(msg->x, msg->y, msg->z);
   }
@@ -223,7 +221,7 @@ private:
   }
 
   // Timer callback: perform integration and high-pass filtering, publish velocity and position, and broadcast TF.
-  void timer_callback() 
+  void timer_callback_() 
   {
 
     // Perform translation estimation.
