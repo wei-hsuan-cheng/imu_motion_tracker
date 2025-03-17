@@ -1,12 +1,15 @@
+// quat, acc
 #include <Arduino.h>
 #include <micro_ros_platformio.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
+#include <std_msgs/msg/bool.h>
 #include <geometry_msgs/msg/quaternion.h>
 #include <geometry_msgs/msg/vector3.h>
 
+// MPU6050 libraries
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 
@@ -26,20 +29,24 @@ uint8_t fifoBuffer[64];
 Quaternion q_imu;         // container for the quaternion from the MPU6050
 
 // Variables for acceleration calculations:
-VectorInt16 aa;         // Raw acceleration values from the FIFO
-VectorInt16 aaReal;     // Gravity-compensated (linear) acceleration
-VectorFloat gravity;    // Gravity vector
+VectorInt16 aa;         // raw accelerometer values from FIFO
+VectorInt16 aaReal;     // linear acceleration (gravity removed) in sensor frame
+VectorInt16 aaWorld;    // linear acceleration in world frame
+VectorFloat gravity;    // gravity vector
 
-// Interrupt callback: set flag when data is ready
+// Interrupt callback: set flag when new data is ready
 void dmpDataReady() {
   mpuInterrupt = true;
 }
 
 // ----- micro-ROS Objects -----
+rcl_publisher_t com_pub_;
 rcl_publisher_t quat_pub_;
 rcl_publisher_t acc_pub_;
-geometry_msgs__msg__Vector3 acc_msg;
+
+std_msgs__msg__Bool com_msg;
 geometry_msgs__msg__Quaternion q_msg;
+geometry_msgs__msg__Vector3 acc_msg;
 
 rclc_executor_t executor;
 rclc_support_t support;
@@ -60,7 +67,7 @@ void error_loop() {
 }
 
 void imu_calibration() {
-  // Supply your own imu offsets (adjust based on your calibration)
+  // Supply your own IMU offsets (adjust based on your calibration)
   mpu.setXGyroOffset(12);
   mpu.setYGyroOffset(52);
   mpu.setZGyroOffset(2);
@@ -76,14 +83,21 @@ void setup_micro_ros() {
 
   // --- Domain ID Initialization ---
   rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
-  RCCHECK(rcl_init_options_init(&init_options, allocator));   // Initialize options with the allocator
-  RCCHECK(rcl_init_options_set_domain_id(&init_options, domain_id)); // Set the desired domain
+  RCCHECK(rcl_init_options_init(&init_options, allocator));
+  RCCHECK(rcl_init_options_set_domain_id(&init_options, domain_id));
 
   // Initialize support using the options we configured
   RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
 
-  // --- Create Node and Publisher ---
+  // --- Create Node and Publishers ---
   RCCHECK(rclc_node_init_default(&node, "mpu6050_imu", "", &support));
+
+  RCCHECK(rclc_publisher_init_default(
+      &com_pub_,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+      "/mpu6050_imu/communication_signal"
+  ));
 
   RCCHECK(rclc_publisher_init_default(
     &quat_pub_,
@@ -99,9 +113,8 @@ void setup_micro_ros() {
     "/mpu6050_imu/acc"
   ));
 
-  // Create the executor
+  // Create the executor (we're polling in the loop)
   RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
-
 }
 
 void setup() {
@@ -111,7 +124,7 @@ void setup() {
     Wire.setClock(400000);
   #endif
 
-  Serial.begin(115200);  // Initialize Serial once with the desired baud rate for debugging and micro-ROS transport.
+  Serial.begin(115200);  // Initialize Serial once with desired baud rate
   while (!Serial);
   Serial.println("Initializing MPU6050...");
   
@@ -163,30 +176,328 @@ void loop() {
     q_msg.z = q_imu.z;
     RCSOFTCHECK(rcl_publish(&quat_pub_, &q_msg, NULL));
 
-    // Get the acceleration from the FIFO packet and publish it
+    // Get acceleration from the FIFO packet:
     mpu.dmpGetAccel(&aa, fifoBuffer);
     mpu.dmpGetGravity(&gravity, &q_imu);
     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+    mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q_imu);
     float g_const = 9.80665;
-    float a_s_real[3];
-    a_s_real[0] = (float) aaReal.x * g_const / 8192;
-    a_s_real[1] = (float) aaReal.y * g_const / 8192;
-    a_s_real[2] = (float) aaReal.z * g_const / 8192;
-    acc_msg.x = a_s_real[0];
-    acc_msg.y = a_s_real[1];
-    acc_msg.z = a_s_real[2];
+
+    // World-frame acceleration
+    float a_world[3];
+    a_world[0] = (float) aaWorld.x * g_const / 8192;
+    a_world[1] = (float) aaWorld.y * g_const / 8192;
+    a_world[2] = (float) aaWorld.z * g_const / 8192;
+
+    // Publish the filtered acceleration
+    acc_msg.x = a_world[0];
+    acc_msg.y = a_world[1];
+    acc_msg.z = a_world[2];
     RCSOFTCHECK(rcl_publish(&acc_pub_, &acc_msg, NULL));
 
     // Blink the LED as a simple indicator
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+
   }
+
+  // Publish a communication signal to indicate that the node is alive
+  com_msg.data = true;
+  RCSOFTCHECK(rcl_publish(&com_pub_, &com_msg, NULL));
 }
 
 
 
 
 
-// // IMU position and orientation estimation
+
+
+// // quat, acc, vel, pos
+// #include <Arduino.h>
+// #include <micro_ros_platformio.h>
+// #include <rcl/rcl.h>
+// #include <rcl/error_handling.h>
+// #include <rclc/rclc.h>
+// #include <rclc/executor.h>
+// #include <std_msgs/msg/bool.h>
+// #include <geometry_msgs/msg/quaternion.h>
+// #include <geometry_msgs/msg/vector3.h>
+
+// // MPU6050 libraries
+// #include "I2Cdev.h"
+// #include "MPU6050_6Axis_MotionApps20.h"
+
+// // High-pass and low-pass filter libraries
+// #include <filters.h>
+
+// #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+//   #include "Wire.h"
+// #endif
+
+// // ----- MPU6050 Definitions -----
+// MPU6050 mpu;
+// #define INTERRUPT_PIN 2   // for ESP32, choose an available interrupt-capable pin
+// #define LED_PIN 13        // onboard LED for activity indication
+// volatile bool mpuInterrupt = false;
+// bool dmpReady = false;
+// uint8_t devStatus;
+// uint16_t packetSize;
+// uint8_t fifoBuffer[64];
+// Quaternion q_imu;         // container for the quaternion from the MPU6050
+
+// // Variables for acceleration calculations:
+// VectorInt16 aa;         // raw accelerometer values from FIFO
+// VectorInt16 aaReal;     // linear acceleration (gravity removed) in sensor frame
+// VectorInt16 aaWorld;    // linear acceleration in world frame
+// VectorFloat gravity;    // gravity vector
+
+// // Integration variables for velocity and position (m/s and m, respectively)
+// float velocity[3] = {0, 0, 0};
+// float position[3] = {0, 0, 0};
+// const float Ts = 0.05; // integration time step (in seconds)
+
+// // High-pass filter objects to remove drift in velocity and position
+// const float vel_cutoff = 0.1; // Hz
+// const float pos_cutoff = 0.1; // Hz
+// Filter vel_filter_x(vel_cutoff, Ts, IIR::ORDER::OD2, IIR::TYPE::HIGHPASS);
+// Filter vel_filter_y(vel_cutoff, Ts, IIR::ORDER::OD2, IIR::TYPE::HIGHPASS);
+// Filter vel_filter_z(vel_cutoff, Ts, IIR::ORDER::OD2, IIR::TYPE::HIGHPASS);
+// Filter pos_filter_x(pos_cutoff, Ts, IIR::ORDER::OD2, IIR::TYPE::HIGHPASS);
+// Filter pos_filter_y(pos_cutoff, Ts, IIR::ORDER::OD2, IIR::TYPE::HIGHPASS);
+// Filter pos_filter_z(pos_cutoff, Ts, IIR::ORDER::OD2, IIR::TYPE::HIGHPASS);
+
+// // *** New: Low-pass filters for acceleration ***
+// // We use a cutoff frequency (in Hz) that suits your noise characteristics.
+// // Adjust these parameters as needed.
+// const float acc_lp_cutoff = 10.0; // Hz
+// Filter acc_lowpass_x(acc_lp_cutoff, Ts, IIR::ORDER::OD3, IIR::TYPE::LOWPASS);
+// Filter acc_lowpass_y(acc_lp_cutoff, Ts, IIR::ORDER::OD3, IIR::TYPE::LOWPASS);
+// Filter acc_lowpass_z(acc_lp_cutoff, Ts, IIR::ORDER::OD3, IIR::TYPE::LOWPASS);
+
+// // Interrupt callback: set flag when new data is ready
+// void dmpDataReady() {
+//   mpuInterrupt = true;
+// }
+
+// // ----- micro-ROS Objects -----
+// rcl_publisher_t com_pub_;
+// rcl_publisher_t quat_pub_;
+// rcl_publisher_t acc_pub_;
+// rcl_publisher_t vel_pub_;
+// rcl_publisher_t pos_pub_;
+
+// std_msgs__msg__Bool com_msg;
+// geometry_msgs__msg__Quaternion q_msg;
+// geometry_msgs__msg__Vector3 acc_msg;
+// geometry_msgs__msg__Vector3 vel_msg;
+// geometry_msgs__msg__Vector3 pos_msg;
+
+// rclc_executor_t executor;
+// rclc_support_t support;
+// rcl_allocator_t allocator;
+// rcl_node_t node;
+
+// size_t domain_id = 5; // Set your desired ROS_DOMAIN_ID here
+
+// // Macros to check return values
+// #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){ error_loop(); } }
+// #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){} }
+
+// // Error loop (halts execution)
+// void error_loop() {
+//   while (1) {
+//     delay(100);
+//   }
+// }
+
+// void imu_calibration() {
+//   // Supply your own IMU offsets (adjust based on your calibration)
+//   mpu.setXGyroOffset(12);
+//   mpu.setYGyroOffset(52);
+//   mpu.setZGyroOffset(2);
+//   mpu.setZAccelOffset(1804);
+// }
+
+// // Initialize micro-ROS with ROS_DOMAIN_ID support
+// void setup_micro_ros() {
+//   // Set up the serial transports (Serial must already be initialized)
+//   set_microros_serial_transports(Serial);
+
+//   allocator = rcl_get_default_allocator();
+
+//   // --- Domain ID Initialization ---
+//   rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+//   RCCHECK(rcl_init_options_init(&init_options, allocator));
+//   RCCHECK(rcl_init_options_set_domain_id(&init_options, domain_id));
+
+//   // Initialize support using the options we configured
+//   RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
+
+//   // --- Create Node and Publishers ---
+//   RCCHECK(rclc_node_init_default(&node, "mpu6050_imu", "", &support));
+
+//   RCCHECK(rclc_publisher_init_default(
+//       &com_pub_,
+//       &node,
+//       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+//       "/mpu6050_imu/communication_signal"
+//   ));
+
+//   RCCHECK(rclc_publisher_init_default(
+//     &quat_pub_,
+//     &node,
+//     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Quaternion),
+//     "/mpu6050_imu/quat"
+//   ));
+
+//   RCCHECK(rclc_publisher_init_default(
+//     &acc_pub_,
+//     &node,
+//     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
+//     "/mpu6050_imu/acc"
+//   ));
+
+//   RCCHECK(rclc_publisher_init_default(
+//     &vel_pub_,
+//     &node,
+//     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
+//     "/mpu6050_imu/vel"
+//   ));
+
+//   RCCHECK(rclc_publisher_init_default(
+//     &pos_pub_,
+//     &node,
+//     ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Vector3),
+//     "/mpu6050_imu/pos"
+//   ));
+
+//   // Create the executor (we're polling in the loop)
+//   RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+// }
+
+// void setup() {
+//   // --- MPU6050 Setup ---
+//   #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+//     Wire.begin();
+//     Wire.setClock(400000);
+//   #endif
+
+//   Serial.begin(115200);  // Initialize Serial once with desired baud rate
+//   while (!Serial);
+//   Serial.println("Initializing MPU6050...");
+  
+//   mpu.initialize();
+//   pinMode(INTERRUPT_PIN, INPUT);
+//   Serial.println(mpu.testConnection() ? "MPU6050 connection successful" : "MPU6050 connection failed");
+
+//   Serial.println("Initializing DMP...");
+//   devStatus = mpu.dmpInitialize();
+  
+//   // Calibrate IMU offsets
+//   imu_calibration();
+
+//   if (devStatus == 0) {
+//     mpu.CalibrateAccel(6);
+//     mpu.CalibrateGyro(6);
+//     mpu.setDMPEnabled(true);
+//     attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+//     dmpReady = true;
+//     packetSize = mpu.dmpGetFIFOPacketSize();
+//     Serial.println("DMP ready!");
+//   } else {
+//     Serial.print("DMP Initialization failed (code ");
+//     Serial.print(devStatus);
+//     Serial.println(")");
+//     while (1);
+//   }
+
+//   pinMode(LED_PIN, OUTPUT);
+
+//   // --- micro-ROS Setup ---
+//   setup_micro_ros();
+// }
+
+// void loop() {
+//   // Spin the micro-ROS executor briefly to process any callbacks
+//   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+
+//   // Process MPU6050 data and publish if available:
+//   if (dmpReady && mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+//     // Reset interrupt flag
+//     mpuInterrupt = false;
+
+//     // Get the quaternion from the FIFO packet and publish it
+//     mpu.dmpGetQuaternion(&q_imu, fifoBuffer);
+//     q_msg.w = q_imu.w;
+//     q_msg.x = q_imu.x;
+//     q_msg.y = q_imu.y;
+//     q_msg.z = q_imu.z;
+//     RCSOFTCHECK(rcl_publish(&quat_pub_, &q_msg, NULL));
+
+//     // Get acceleration from the FIFO packet:
+//     mpu.dmpGetAccel(&aa, fifoBuffer);
+//     mpu.dmpGetGravity(&gravity, &q_imu);
+//     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+//     mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q_imu);
+//     float g_const = 9.80665;
+
+//     // World-frame acceleration
+//     float a_world[3];
+//     a_world[0] = (float) aaWorld.x * g_const / 8192;
+//     a_world[1] = (float) aaWorld.y * g_const / 8192;
+//     a_world[2] = (float) aaWorld.z * g_const / 8192;
+
+//     // --- Apply Low-Pass Filter to World Acceleration ---
+//     float a_world_lp[3];
+//     a_world_lp[0] = acc_lowpass_x.filterIn(a_world[0]);
+//     a_world_lp[1] = acc_lowpass_y.filterIn(a_world[1]);
+//     a_world_lp[2] = acc_lowpass_z.filterIn(a_world[2]);
+
+//     // Publish the filtered acceleration
+//     acc_msg.x = a_world_lp[0];
+//     acc_msg.y = a_world_lp[1];
+//     acc_msg.z = a_world_lp[2];
+//     RCSOFTCHECK(rcl_publish(&acc_pub_, &acc_msg, NULL));
+
+//     // --- Velocity and Position Estimation ---
+//     // Use the filtered acceleration for integration
+//     velocity[0] += a_world_lp[0] * Ts;
+//     velocity[1] += a_world_lp[1] * Ts;
+//     velocity[2] += a_world_lp[2] * Ts;
+//     // Apply high-pass filter to remove low-frequency drift in velocity
+//     float vel_filt_x = vel_filter_x.filterIn(velocity[0]);
+//     float vel_filt_y = vel_filter_y.filterIn(velocity[1]);
+//     float vel_filt_z = vel_filter_z.filterIn(velocity[2]);
+//     vel_msg.x = vel_filt_x;
+//     vel_msg.y = vel_filt_y;
+//     vel_msg.z = vel_filt_z;
+//     RCSOFTCHECK(rcl_publish(&vel_pub_, &vel_msg, NULL));
+
+//     // Integrate filtered velocity to compute position (using simple Euler integration)
+//     position[0] += vel_filt_x * Ts + 0.5 * a_world_lp[0] * Ts * Ts;
+//     position[1] += vel_filt_y * Ts + 0.5 * a_world_lp[1] * Ts * Ts;
+//     position[2] += vel_filt_z * Ts + 0.5 * a_world_lp[2] * Ts * Ts;
+//     // Apply high-pass filter to remove drift in position
+//     float pos_filt_x = pos_filter_x.filterIn(position[0]);
+//     float pos_filt_y = pos_filter_y.filterIn(position[1]);
+//     float pos_filt_z = pos_filter_z.filterIn(position[2]);
+//     pos_msg.x = pos_filt_x;
+//     pos_msg.y = pos_filt_y;
+//     pos_msg.z = pos_filt_z;
+//     RCSOFTCHECK(rcl_publish(&pos_pub_, &pos_msg, NULL));
+
+//     // Blink the LED as a simple indicator
+//     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+
+//   }
+
+//   // Publish a communication signal to indicate that the node is alive
+//   com_msg.data = true;
+//   RCSOFTCHECK(rcl_publish(&com_pub_, &com_msg, NULL));
+// }
+
+
+
+// // MPU6050 libraries (for calibration)
 // #include <micro_ros_platformio.h>
 // #include <rcl/rcl.h>
 // #include <rclc/rclc.h>
@@ -454,22 +765,22 @@ void loop() {
         //     delay(33);
         // #endif
 
-//         #ifdef OUTPUT_READABLE_WORLDACCEL
-//             // display initial world-frame acceleration, adjusted to remove gravity
-//             // and rotated based on known orientation from quaternion
-//             mpu.dmpGetQuaternion(&q, fifoBuffer);
-//             mpu.dmpGetAccel(&aa, fifoBuffer);
-//             mpu.dmpGetGravity(&gravity, &q);
-//             mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
-//             mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
-//             Serial.print("aworld\t");
-//             Serial.print(aaWorld.x);
-//             Serial.print("\t");
-//             Serial.print(aaWorld.y);
-//             Serial.print("\t");
-//             Serial.println(aaWorld.z);
-//             delay(33);
-//         #endif
+        // #ifdef OUTPUT_READABLE_WORLDACCEL
+        //     // display initial world-frame acceleration, adjusted to remove gravity
+        //     // and rotated based on known orientation from quaternion
+        //     mpu.dmpGetQuaternion(&q, fifoBuffer);
+        //     mpu.dmpGetAccel(&aa, fifoBuffer);
+        //     mpu.dmpGetGravity(&gravity, &q);
+        //     mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
+        //     mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &q);
+        //     Serial.print("aworld\t");
+        //     Serial.print(aaWorld.x);
+        //     Serial.print("\t");
+        //     Serial.print(aaWorld.y);
+        //     Serial.print("\t");
+        //     Serial.println(aaWorld.z);
+        //     delay(33);
+        // #endif
     
 //         #ifdef OUTPUT_TEAPOT
 //             // display quaternion values in InvenSense Teapot demo format:
@@ -490,333 +801,3 @@ void loop() {
 //         digitalWrite(LED_PIN, blinkState);
 //     }
 // }
-
-
-
-
-
-// // // Old
-// // /*
-// // The contents of this code and instructions are the intellectual property of Carbon Aeronautics. 
-// // The text and figures in this code and instructions are licensed under a Creative Commons Attribution - Noncommercial - ShareAlike 4.0 International Public Licence. 
-// // This license lets you remix, adapt, and build upon your work non-commercially, as long as you credit Carbon Aeronautics 
-// // (but not in any way that suggests that we endorse you or your use of the work) and license your new creations under the identical terms.
-// // This code and instruction is provided "As Is” without any further warranty. Neither Carbon Aeronautics or the author has any liability to any person or entity 
-// // with respect to any loss or damage caused or declared to be caused directly or indirectly by the instructions contained in this code or by 
-// // the software and hardware described in it. As Carbon Aeronautics has no control over the use, setup, assembly, modification or misuse of the hardware, 
-// // software and information described in this manual, no liability shall be assumed nor accepted for any resulting damage or injury. 
-// // By the act of copying, use, setup or assembly, the user accepts all resulting liability.
-
-// // 1.0  29 December 2022 -  initial release
-// // */
-// // #include <Arduino.h>
-// // #include <Wire.h>
-// // #include <BasicLinearAlgebra.h>
-
-// // using namespace BLA;
-
-// // template <int Dim, typename DType = float>
-// // struct DiagonalMatrix : public MatrixBase<DiagonalMatrix<Dim>, Dim, Dim, DType>
-// // {
-// //     Matrix<Dim, 1, DType> diagonal;
-
-// //     // For const matrices (ones whose elements can't be modified) you just need to implement this function:
-// //     DType operator()(int row, int col) const
-// //     {
-// //         // If it's on the diagonal and it's not larger than the matrix dimensions then return the element
-// //         if (row == col)
-// //             return diagonal(row);
-// //         else
-// //             // Otherwise return zero
-// //             return 0.0f;
-// //     }
-
-// //     // If you want to declare a matrix whose elements can be modified then you'll need to define this function:
-// //     // DType& operator()(int row, int col)
-// // };
-
-// // float d2r = 3.14159265359/180.0, r2d = 180.0/3.14159265359;
-// // float m2mm = 1000.0, mm2m = 0.001;
-// // float RateRoll, RatePitch, RateYaw;
-// // float RateCalibrationRoll, RateCalibrationPitch, RateCalibrationYaw;
-// // int RateCalibrationNumber;
-// // int RateCalibrationTotalNumber = 1000;
-// // float g = 9.80665;
-// // float AccX, AccY, AccZ;
-// // float AccxOffset = 0.0, AccyOffset = 0.0, AcczOffset = 0.0;
-// // float AccXCompensated = 0.0, AccYCompensated = 0.0, AccZCompensated = 0.0;
-// // float PosX = 0.0, PosY = 0.0, PosZ = 0.0;
-// // float VelX = 0.0, VelY = 0.0, VelZ = 0.0;
-// // float AngleRoll, AnglePitch;
-// // float AngleRollIntegration = 0.0, AnglePitchIntegration = 0.0, AngleYawIntegration = 0.0;
-// // uint32_t LoopTimer;
-// // float Ts = 0.004; // [s]
-// // uint32_t Ts_ms = (int) (Ts * 1000); // [ms]
-// // uint32_t Ts_us = (int) (Ts * 1000000); // [us]
-// // float PNstd = 4.0 * pow(10.0, 0.0);
-// // float MNstd = 2.5 * pow(10.0, -1.0);
-// // float KalmanAngleRoll=0, KalmanUncertaintyAngleRoll=2*2;
-// // float KalmanAnglePitch=0, KalmanUncertaintyAnglePitch=2*2;
-// // float Kalman1DOutput[]={0,0};
-
-// // void imu_signals(void) {
-// //   Wire.beginTransmission(0x68);
-// //   Wire.write(0x1A);
-// //   Wire.write(0x05);
-// //   Wire.endTransmission();
-// //   Wire.beginTransmission(0x68);
-// //   Wire.write(0x1C);
-// //   Wire.write(0x10);
-// //   Wire.endTransmission();
-// //   Wire.beginTransmission(0x68);
-// //   Wire.write(0x3B);
-// //   Wire.endTransmission(); 
-// //   Wire.requestFrom(0x68,6);
-// //   int16_t AccXLSB = Wire.read() << 8 | Wire.read();
-// //   int16_t AccYLSB = Wire.read() << 8 | Wire.read();
-// //   int16_t AccZLSB = Wire.read() << 8 | Wire.read();
-// //   Wire.beginTransmission(0x68);
-// //   Wire.write(0x1B); 
-// //   Wire.write(0x8);
-// //   Wire.endTransmission();     
-// //   Wire.beginTransmission(0x68);
-// //   Wire.write(0x43);
-// //   Wire.endTransmission();
-// //   Wire.requestFrom(0x68,6);
-
-// //   int16_t GyroX=Wire.read()<<8 | Wire.read();
-// //   int16_t GyroY=Wire.read()<<8 | Wire.read();
-// //   int16_t GyroZ=Wire.read()<<8 | Wire.read();
-
-// //   // RateRoll = (float) GyroX * (2.0 / 65.5) * d2r;
-// //   // RatePitch = (float) GyroY * (2.0 / 65.5) * d2r;
-// //   // RateYaw = (float) GyroZ * (2.0 / 65.5) * d2r;
-
-// //   RateRoll = (float) GyroX * (2.0 / 65.5) * d2r;
-// //   RatePitch = (float) GyroY * (2.0 / 65.5) * d2r;
-// //   RateYaw = (float) GyroZ * (2.0 / 65.5) * d2r;
-
-// //   // AccxOffset = -0.02;
-// //   // AccyOffset = 0.01;
-// //   // AcczOffset = 0.02;
-// //   // AccX = (float) AccXLSB/4096 + AccxOffset;
-// //   // AccY = (float) AccYLSB/4096 + AccyOffset;
-// //   // AccZ = (float) AccZLSB/4096 + AcczOffset;
-// //   // AccX *= g;
-// //   // AccY *= g;
-// //   // AccZ *= g;
-
-
-// //   AccxOffset = -0.13665;
-// //   AccyOffset = 0.08335;
-// //   AcczOffset = 0.23665;
-// //   AccX = (float) AccXLSB * g / 4096 + AccxOffset;
-// //   AccY = (float) AccYLSB * g / 4096 + AccyOffset;
-// //   AccZ = (float) AccZLSB * g / 4096 + AcczOffset;
-
-// //   AngleRoll = atan(AccY/sqrt(AccX*AccX + AccZ*AccZ));
-// //   AnglePitch = -atan(AccX/sqrt(AccY*AccY + AccZ*AccZ));
-// // }
-
-// // void remove_omega_bias() {
-// //   RateRoll -= RateCalibrationRoll;
-// //   RatePitch -= RateCalibrationPitch;
-// //   RateYaw -= RateCalibrationYaw;
-// // }
-
-// // void kalman_1d(float KalmanState, float KalmanUncertainty, float KalmanInput, float KalmanMeasurement) {
-// //   KalmanState = KalmanState + Ts*KalmanInput;
-// //   KalmanUncertainty = KalmanUncertainty + Ts*Ts * PNstd*PNstd;
-// //   float KalmanGain = KalmanUncertainty * 1/(1*KalmanUncertainty + MNstd*MNstd);
-// //   KalmanState = KalmanState + KalmanGain * (KalmanMeasurement-KalmanState);
-// //   KalmanUncertainty = (1-KalmanGain) * KalmanUncertainty;
-// //   Kalman1DOutput[0] = KalmanState; 
-// //   Kalman1DOutput[1] = KalmanUncertainty;
-// // }
-
-// // void compute_thx(float wx) {
-// //   AngleRollIntegration += Ts * wx;
-// // }
-
-// // void compute_thy(float wy) {
-// //   AnglePitchIntegration += Ts * wy;
-// // }
-
-// // void compute_thz(float wz) {
-// //   AngleYawIntegration += Ts * wz;
-// // }
-
-// // void compute_px_vx(float a) {
-// //   VelX += Ts * a;
-// //   PosX += Ts * VelX + 0.5 * Ts * Ts * a;
-// // }
-
-// // void compute_py_vy(float a) {
-// //   VelY += Ts * a;
-// //   PosY += Ts * VelY + 0.5 * Ts * Ts * a;
-// // }
-
-// // void compute_pz_vz(float a) {
-// //   VelZ += Ts * a;
-// //   PosZ += Ts * VelZ + 0.5 * Ts * Ts * a;
-// // }
-
-// // void print_results(float valueX, float valueY, float valueZ) {
-// //   Serial.print(" = [");
-// //   Serial.print(valueX);
-// //   Serial.print(", ");
-// //   Serial.print(valueY);
-// //   Serial.print(", ");
-// //   Serial.print(valueZ);
-// //   Serial.print("]; ");
-// // }
-
-
-// // // Rotation about Z axis
-// // BLA::Matrix<3, 3> Rotz(float thz) {
-// //   BLA::Matrix<3, 3> mat;
-// //   // [ cos(thz)  -sin(thz)   0 ]
-// //   // [ sin(thz)   cos(thz)   0 ]
-// //   // [    0          0       1 ]
-// //   mat(0,0) = cos(thz);
-// //   mat(0,1) = -sin(thz);
-// //   mat(0,2) = 0;
-// //   mat(1,0) = sin(thz);
-// //   mat(1,1) = cos(thz);
-// //   mat(1,2) = 0;
-// //   mat(2,0) = 0;
-// //   mat(2,1) = 0;
-// //   mat(2,2) = 1;
-// //   return mat;
-// // }
-
-// // // Rotation about Y axis
-// // BLA::Matrix<3, 3> Roty(float thy) {
-// //   BLA::Matrix<3, 3> mat;
-// //   // [  cos(thy)   0   sin(thy) ]
-// //   // [     0       1      0     ]
-// //   // [ -sin(thy)   0   cos(thy) ]
-// //   mat(0,0) = cos(thy);
-// //   mat(0,1) = 0;
-// //   mat(0,2) = sin(thy);
-// //   mat(1,0) = 0;
-// //   mat(1,1) = 1;
-// //   mat(1,2) = 0;
-// //   mat(2,0) = -sin(thy);
-// //   mat(2,1) = 0;
-// //   mat(2,2) = cos(thy);
-// //   return mat;
-// // }
-
-// // // Rotation about X axis
-// // BLA::Matrix<3, 3> Rotx(float thx) {
-// //   BLA::Matrix<3, 3> mat;
-// //   // [ 1      0         0      ]
-// //   // [ 0   cos(thx)  -sin(thx) ]
-// //   // [ 0   sin(thx)   cos(thx) ]
-// //   mat(0,0) = 1;
-// //   mat(0,1) = 0;
-// //   mat(0,2) = 0;
-// //   mat(1,0) = 0;
-// //   mat(1,1) = cos(thx);
-// //   mat(1,2) = -sin(thx);
-// //   mat(2,0) = 0;
-// //   mat(2,1) = sin(thx);
-// //   mat(2,2) = cos(thx);
-// //   return mat;
-// // }
-
-// // // Rotation from ZYX Euler angles
-// // BLA::Matrix<3, 3> Rotzyx(float thz, float thy, float thx) {
-// //   return Rotz(thz) * Roty(thy) * Rotx(thx);
-// // }
-
-
-// // void setup() {
-// //   Serial.begin(57600);
-// //   pinMode(13, OUTPUT);
-// //   digitalWrite(13, HIGH);
-// //   Wire.setClock(400000);
-// //   Wire.begin();
-// //   delay(250);
-// //   Wire.beginTransmission(0x68); 
-// //   Wire.write(0x6B);
-// //   Wire.write(0x00);
-// //   Wire.endTransmission();
-// //   for (RateCalibrationNumber = 0; RateCalibrationNumber < RateCalibrationTotalNumber; RateCalibrationNumber ++) {
-// //     imu_signals();
-// //     RateCalibrationRoll += RateRoll;
-// //     RateCalibrationPitch += RatePitch;
-// //     RateCalibrationYaw += RateYaw;
-// //     Serial.print("[MPU6050 Gyro Calibration] ");
-// //     Serial.print( (float) RateCalibrationNumber / RateCalibrationTotalNumber * 100);
-// //     Serial.println("%");
-// //     delay(1);
-// //   }
-// //   RateCalibrationRoll /= RateCalibrationTotalNumber;
-// //   RateCalibrationPitch /= RateCalibrationTotalNumber;
-// //   RateCalibrationYaw /= RateCalibrationTotalNumber;
-// //   LoopTimer=micros();
-// // }
-
-// // void loop() {
-// //   // Get IMU signals
-// //   imu_signals();
-// //   remove_omega_bias();
-
-// //   // Orientation estimation
-// //   kalman_1d(KalmanAngleRoll, KalmanUncertaintyAngleRoll, RateRoll, AngleRoll);
-// //   KalmanAngleRoll=Kalman1DOutput[0]; 
-// //   KalmanUncertaintyAngleRoll=Kalman1DOutput[1];
-
-// //   kalman_1d(KalmanAnglePitch, KalmanUncertaintyAnglePitch, RatePitch, AnglePitch);
-// //   KalmanAnglePitch=Kalman1DOutput[0]; 
-// //   KalmanUncertaintyAnglePitch=Kalman1DOutput[1];
-
-// //   compute_thx(RateRoll);
-// //   compute_thy(RatePitch);
-// //   compute_thz(RateYaw);
-
-// //   // Position estimation
-// //   // Acc requires orientation estimation to do gravity compensation!!! (e.g. use rotation matrix)
-// //   // Calculate the gravity vector in the sensor frame using rotation matrix from ZYX Euler angles
-// //   BLA::Matrix<3, 3> R_w_s = Rotzyx(AngleYawIntegration, KalmanAnglePitch, KalmanAngleRoll);
-// //   BLA::Matrix<3, 1> g_w(0, 0, -g);
-// //   BLA::Matrix<3, 1> g_s = (~R_w_s) * g_w; // transpose of R_w_s
-// //   BLA::Matrix<3, 1> a_s(AccX, AccY, AccZ);
-// //   BLA::Matrix<3, 1> a_s_compensated = a_s + g_s;
-
-// //   compute_px_vx(a_s_compensated(0));
-// //   compute_py_vy(a_s_compensated(1));
-// //   compute_pz_vz(a_s_compensated(2));
-
-// //   // Print results
-// //   // Serial.print("[MPU6050 position and orientation estimation] ");
-
-// //   // Serial.print("a_s [m/s^2]");
-// //   // print_results(a_s(0), a_s(1), a_s(2));
-
-// //   // Serial.print("g_s [m/s^2]");
-// //   // print_results(g_s(0), g_s(1), g_s(2));
-
-// //   // Serial.print("a_s_compensated [m/s^2]");
-// //   // print_results(a_s_compensated(0), a_s_compensated(1), a_s_compensated(2));
-
-// //   // Serial.print("Vel [mm/s] = [");
-// //   // print_results(VelX * m2mm, VelY * m2mm, VelZ * m2mm);
-
-// //   // Serial.print("Pos [mm] = [");
-// //   // print_results(PosX * m2mm, PosY * m2mm, PosZ * m2mm);
-
-// //   // Serial.print("Omega [°/s]");
-// //   // print_results(RateRoll, RatePitch, RateYaw);
-
-// //   Serial.print("Orientation [°]");
-// //   print_results(KalmanAngleRoll * r2d, KalmanAnglePitch * r2d, AngleYawIntegration * r2d);
-// //   // print_results(AngleRollIntegration * r2d, AnglePitchIntegration * r2d, AngleYawIntegration * r2d);
-
-// //   Serial.println("");
-
-// //   while (micros() - LoopTimer < Ts_us);
-// //   LoopTimer=micros();
-// // }
