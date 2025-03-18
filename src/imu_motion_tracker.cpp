@@ -17,6 +17,7 @@
 #include "robot_math_utils/robot_math_utils_v1_8.hpp"
 #include "filters/hpf.hpp"
 #include "filters/lpf.hpp"
+#include "kf_cpp/ekf.hpp"
 
 using namespace std::chrono_literals;
 using Eigen::Vector3d;
@@ -62,8 +63,8 @@ public:
     quat_.y = 0.0;
     quat_.z = 0.0;
 
-    // Initialize state-space model for translation estimation.
-    updateStateSpaceModel();
+    // Initialize KF for translation estimation.
+    updateEKF();
 
     // Instantiate high-pass filters.
     pos_hpf_ = std::make_unique<HighPassFilter<Vector3d>>(0.5, Ts_);
@@ -108,8 +109,12 @@ private:
 
   // Translation
   Vector3d acc_;
+  int dim_x_, dim_z_, dim_w_;
   VectorXd X_;
   MatrixXd F_;
+  MatrixXd H_;
+  std::shared_ptr<ExtendedKalmanFilter> ekf_;
+  MatrixXd Gamma_;
 
   // Filters
   std::unique_ptr<HighPassFilter<Vector3d>> pos_hpf_;
@@ -135,9 +140,13 @@ private:
 
   void updateStateSpaceModel() 
   {
-    X_ = VectorXd::Zero(9);
+    dim_x_ = 9;
+    dim_z_ = 3;
+    dim_w_ = 3;
 
-    F_ = MatrixXd::Zero(9, 9);
+    X_ = VectorXd::Zero(dim_x_);
+
+    F_ = MatrixXd::Zero(dim_x_, dim_x_);
     F_ << 1, 0, 0, Ts_, 0, 0, 0.5 * Ts_ * Ts_, 0, 0,
           0, 1, 0, 0, Ts_, 0, 0, 0.5 * Ts_ * Ts_, 0,
           0, 0, 1, 0, 0, Ts_, 0, 0, 0,
@@ -147,7 +156,62 @@ private:
           0, 0, 0, 0, 0, 0, 1, 0, 0,
           0, 0, 0, 0, 0, 0, 0, 1, 0,
           0, 0, 0, 0, 0, 0, 0, 0, 1;
+    
+    H_ = MatrixXd::Zero(dim_z_, dim_x_);
+    H_ << 0, 0, 0, 0, 0, 0, 1, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 1, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 1;
 
+  }
+
+  void updateEKF()
+  {
+    // Initialize the state-space model.
+    updateStateSpaceModel();
+
+    ekf_ = std::make_shared<ExtendedKalmanFilter>(dim_x_, dim_z_);
+    ekf_->setF(F_);
+    ekf_->setH(H_);
+
+    // Measurement noise covariance
+    double sigma_upsilon = pow(10.0, -1.0);
+    ekf_->setMeasurementNoise(MatrixXd::Identity(dim_z_, dim_z_) * sigma_upsilon * sigma_upsilon);
+
+    // Process noise covariance
+    double sigma_w = pow(10.0, 0.0);
+    Gamma_ = MatrixXd::Zero(dim_x_, dim_w_);
+    Gamma_ << Ts_ * Ts_ * Ts_ / 6.0, 0, 0,
+              0, Ts_ * Ts_ * Ts_ / 6.0, 0,
+              0, 0, Ts_ * Ts_ * Ts_ / 6.0,
+              Ts_ * Ts_ / 2.0, 0, 0,
+              0, Ts_ * Ts_ / 2.0, 0,
+              0, 0, Ts_ * Ts_ / 2.0,
+              Ts_, 0, 0,
+              0, Ts_, 0,
+              0, 0, Ts_;
+
+    ekf_->setProcessNoise(Gamma_ * sigma_w * sigma_w * Gamma_.transpose());
+
+  }
+
+  VectorXd fx(const Eigen::VectorXd &x)
+  {
+      return ekf_->getF() * x;
+  }
+
+  MatrixXd jacobian_F(const Eigen::VectorXd &)
+  {
+      return ekf_->getF();
+  }
+
+  MatrixXd jacobian_H(const Eigen::VectorXd &)
+  {
+      return ekf_->getH();
+  }
+
+  VectorXd hx(const Eigen::VectorXd &x)
+  {
+      return ekf_->getH() * x;
   }
 
   void translationEstimation() 
@@ -169,6 +233,41 @@ private:
 
     // State propagation using the state-space model.
     X_ = F_ * X_;
+  }
+
+  void translationKFEstimation()
+  {
+    // Vector3d measurement = acc_;
+    Vector3d measurement = acc_hpf_->filter( acc_lpf_->filter( acc_ ) );
+
+    if (!measurement.allFinite()) {
+        RCLCPP_WARN(this->get_logger(), "Measurement contains NaN or Inf, skipping this iteration.");
+        return;
+    }
+
+    // EKF time update
+    ekf_->predict(jacobian_F(ekf_->getState()), fx(ekf_->getState()));
+
+    if (!ekf_->getState().allFinite()) {
+        RCLCPP_WARN(this->get_logger(), "State contains NaN or Inf, skipping this iteration.");
+        return;
+    }
+
+    // EKF measurement update
+    ekf_->update(measurement, jacobian_H(ekf_->getState()), hx(ekf_->getState()));
+
+    // EKF estimated position
+    VectorXd ekf_estimate = ekf_->getState();
+    X_.segment(0, 3) = ekf_estimate.head(3);
+    X_.segment(3, 3) = ekf_estimate.segment(3, 3);
+    X_.segment(6, 3) = ekf_estimate.tail(3);
+
+
+  }
+
+  void translationOmit()
+  {
+    X_ = VectorXd::Zero(dim_x_);
   }
 
   void publishStates()
@@ -225,7 +324,9 @@ private:
   {
 
     // Perform translation estimation.
-    translationEstimation();
+    // translationEstimation();
+    // translationKFEstimation();
+    translationOmit();
 
     // Publish states.
     publishStates();
