@@ -334,7 +334,7 @@ private:
     // Broadcast TF transform using the latest quaternion and computed position.
     geometry_msgs::msg::TransformStamped transformStamped;
     transformStamped.header.stamp = this->now();
-    transformStamped.header.frame_id = "map"; // Parent frame.
+    transformStamped.header.frame_id = "world"; // Parent frame.
     transformStamped.child_frame_id = "imu";    // Child frame.
 
     transformStamped.transform.translation.x = X_(0);
